@@ -71,123 +71,36 @@ jobs:
           grep -E '^PKG_(VERSION|RELEASE):=' \
             package/feeds/packages/openvpn/Makefile
 
-      - name: Add Tunnelblick XOR patch
+            - name: Add Tunnelblick XOR patches
         working-directory: sdk
         run: |
-          mkdir -p package/feeds/packages/openvpn/patches
+          set -euxo pipefail
 
-          cat > package/feeds/packages/openvpn/patches/999-openvpn-xor-scramble.patch <<'PATCH'
-          --- a/src/openvpn/forward.c
-          +++ b/src/openvpn/forward.c
-          @@ -1110,6 +1110,10 @@ process_incoming_link_part1(struct context *c, struct link_socket_info *lsi, bool
-               if (c->c2.buf.len > 0)
-               {
-          +        if (c->options.ce.xormethod > 0)
-          +        {
-          +            buffer_mask(&c->c2.buf, c->options.ce.xormask);
-          +        }
-                   if (!link_socket_verify_incoming_addr(&c->c2.buf, lsi, &c->c2.from))
-                   {
-                       link_socket_bad_incoming_addr(&c->c2.buf, lsi, &c->c2.from);
-          @@ -1715,6 +1719,10 @@ process_outgoing_link(struct context *c)
-                           socks_preprocess_outgoing_link(c, &to_addr, &size_delta);
-                       }
+          PATCH_DIR="package/feeds/packages/openvpn/patches"
+          mkdir -p "$PATCH_DIR"
 
-          +            if (c->options.ce.xormethod > 0)
-          +            {
-          +                buffer_mask(&c->c2.to_link, c->options.ce.xormask);
-          +            }
-                       size = link_socket_write(c->c2.link_socket,
-                                                &c->c2.to_link,
-          --- a/src/openvpn/options.c
-          +++ b/src/openvpn/options.c
-          @@ -795,6 +795,7 @@ static const char usage_message[] =
-               "--mark value            : Mark encrypted packets being sent with value.\n"
-          +    "--scramble type [key]   : Enable XOR scrambling.\n"
-               "\n"
-               "Tunnel Options:\n"
-          @@ -1455,6 +1456,8 @@ show_connection_entry(const struct connection_entry *o)
-               SHOW_INT(connect_retry_seconds);
-               SHOW_INT(connect_retry_seconds_max);
-          +    SHOW_INT(xormethod);
-          +    SHOW_STR(xormask);
-               SHOW_INT(connect_timeout);
-          @@ -6375,6 +6378,42 @@ add_option(struct options *options,
-                   goto err;
-               }
-           }
-          +    else if (streq(p[0], "scramble") && p[1] && !p[3])
-          +    {
-          +        VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
-          +
-          +        if (streq(p[1], "xormask") && p[2])
-          +        {
-          +            options->ce.xormethod = 1;
-          +            options->ce.xormask = p[2];
-          +        }
-          +        else if (streq(p[1], "xorptrpos"))
-          +        {
-          +            options->ce.xormethod = 2;
-          +        }
-          +        else if (streq(p[1], "reverse"))
-          +        {
-          +            options->ce.xormethod = 3;
-          +        }
-          +        else if (streq(p[1], "obfuscate") && p[2])
-          +        {
-          +            options->ce.xormethod = 4;
-          +            options->ce.xormask = p[2];
-          +        }
-          +        else
-          +        {
-          +            msg(msglevel, "Unknown scramble method");
-          +            goto err;
-          +        }
-          +    }
-               else if (streq(p[0], "http-proxy") && p[1] && !p[5])
-          --- a/src/openvpn/options.h
-          +++ b/src/openvpn/options.h
-          @@ -132,6 +132,9 @@ struct connection_entry
-               int connect_retry_seconds;
-               int connect_retry_seconds_max;
+          BASE_URL="https://raw.githubusercontent.com/Tunnelblick/Tunnelblick/master/third_party/sources/openvpn/openvpn-2.5.8/patches"
 
-          +    int xormethod;
-          +    const char *xormask;
-          +
-               int connect_timeout;
-          --- a/src/openvpn/socket.c
-          +++ b/src/openvpn/socket.c
-          @@ -56,6 +56,21 @@
-           #include "memdbg.h"
+          wget -O "$PATCH_DIR/999-xor-a.patch" \
+            "$BASE_URL/02-tunnelblick-openvpn_xorpatch-a.diff"
 
-          +void
-          +buffer_mask(struct buffer *buf, const char *mask)
-          +{
-          +    int i;
-          +    const int mask_len = strlen(mask);
-          +
-          +    if (mask_len <= 0)
-          +    {
-          +        return;
-          +    }
-          +
-          +    for (i = 0; i < BLEN(buf); i++)
-          +    {
-          +        BPTR(buf)[i] ^= mask[i % mask_len];
-          +    }
-          +}
-          +
-           const int proto_overhead[] = {
-          --- a/src/openvpn/socket.h
-          +++ b/src/openvpn/socket.h
-          @@ -35,6 +35,8 @@
-           #include "proxy.h"
-           #include "socks.h"
+          wget -O "$PATCH_DIR/999-xor-b.patch" \
+            "$BASE_URL/03-tunnelblick-openvpn_xorpatch-b.diff"
 
-          +void buffer_mask(struct buffer *buf, const char *mask);
-          +
-           /*
-          PATCH
+          wget -O "$PATCH_DIR/999-xor-c.patch" \
+            "$BASE_URL/04-tunnelblick-openvpn_xorpatch-c.diff"
+
+          wget -O "$PATCH_DIR/999-xor-d.patch" \
+            "$BASE_URL/05-tunnelblick-openvpn_xorpatch-d.diff"
+
+          wget -O "$PATCH_DIR/999-xor-e.patch" \
+            "$BASE_URL/06-tunnelblick-openvpn_xorpatch-e.diff"
+
+          for patch_file in "$PATCH_DIR"/999-xor-*.patch; do
+            echo "Downloaded: $patch_file"
+            test -s "$patch_file"
+            head -n 5 "$patch_file"
+          done
 
       - name: Configure package
         working-directory: sdk
