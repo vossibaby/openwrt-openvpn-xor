@@ -21,7 +21,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            clang \
             flex \
             bison \
             g++ \
@@ -44,9 +43,7 @@ jobs:
           wget -O openwrt-sdk.tar.xz "$SDK_URL"
           echo "$SDK_SHA256  openwrt-sdk.tar.xz" | sha256sum -c -
           mkdir sdk
-          tar -xJf openwrt-sdk.tar.xz \
-            --strip-components=1 \
-            -C sdk
+          tar -xJf openwrt-sdk.tar.xz --strip-components=1 -C sdk
 
       - name: Update feeds
         working-directory: sdk
@@ -54,24 +51,32 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Replace OpenVPN package with OpenWrt 23.05 package
+      - name: Replace OpenVPN package
         working-directory: sdk
         run: |
-          rm -rf package/openvpn
+          set -euxo pipefail
+
           git clone \
             --depth 1 \
             --branch "$OPENWRT_BRANCH" \
             https://github.com/openwrt/packages.git \
             packages-source
 
-          cp -a packages-source/net/openvpn package/openvpn
+          rm -rf package/feeds/packages/openvpn
+          cp -a packages-source/net/openvpn package/feeds/packages/openvpn
+
+          sed -i 's/^PKG_RELEASE:=.*/PKG_RELEASE:=99/' \
+            package/feeds/packages/openvpn/Makefile
+
+          grep -E '^PKG_(VERSION|RELEASE):=' \
+            package/feeds/packages/openvpn/Makefile
 
       - name: Add Tunnelblick XOR patch
         working-directory: sdk
         run: |
-          mkdir -p package/openvpn/patches
+          mkdir -p package/feeds/packages/openvpn/patches
 
-          cat > package/openvpn/patches/999-openvpn-xor-scramble.patch <<'PATCH'
+          cat > package/feeds/packages/openvpn/patches/999-openvpn-xor-scramble.patch <<'PATCH'
           --- a/src/openvpn/forward.c
           +++ b/src/openvpn/forward.c
           @@ -1110,6 +1110,10 @@ process_incoming_link_part1(struct context *c, struct link_socket_info *lsi, bool
@@ -87,31 +92,26 @@ jobs:
           @@ -1715,6 +1719,10 @@ process_outgoing_link(struct context *c)
                            socks_preprocess_outgoing_link(c, &to_addr, &size_delta);
                        }
-          
+
           +            if (c->options.ce.xormethod > 0)
           +            {
           +                buffer_mask(&c->c2.to_link, c->options.ce.xormask);
           +            }
-                       /* Send packet */
                        size = link_socket_write(c->c2.link_socket,
                                                 &c->c2.to_link,
           --- a/src/openvpn/options.c
           +++ b/src/openvpn/options.c
           @@ -795,6 +795,7 @@ static const char usage_message[] =
-               "--mark value            : Mark encrypted packets being sent with value. The mark value can be matched in policy routing and packetfilter rules.\n"
-          +    "--scramble type [key]   : Enable XOR scrambling: xormask, xorptrpos, reverse or obfuscate.\n"
+               "--mark value            : Mark encrypted packets being sent with value.\n"
+          +    "--scramble type [key]   : Enable XOR scrambling.\n"
                "\n"
                "Tunnel Options:\n"
-               "--local host             : Local host name or ip address. Implies --bind.\n"
           @@ -1455,6 +1456,8 @@ show_connection_entry(const struct connection_entry *o)
-               SHOW_INT(bind_ipv6_only);
                SHOW_INT(connect_retry_seconds);
                SHOW_INT(connect_retry_seconds_max);
           +    SHOW_INT(xormethod);
           +    SHOW_STR(xormask);
                SHOW_INT(connect_timeout);
-               SHOW_INT(connect_retry_max);
-               SHOW_INT(local_port);
           @@ -6375,6 +6378,42 @@ add_option(struct options *options,
                    goto err;
                }
@@ -140,32 +140,26 @@ jobs:
           +        }
           +        else
           +        {
-          +            msg(msglevel,
-          +                "Unknown scramble method or missing scramble key: %s",
-          +                p[1]);
+          +            msg(msglevel, "Unknown scramble method");
           +            goto err;
           +        }
           +    }
                else if (streq(p[0], "http-proxy") && p[1] && !p[5])
-               {
-                   struct http_proxy_options *ho;
           --- a/src/openvpn/options.h
           +++ b/src/openvpn/options.h
           @@ -132,6 +132,9 @@ struct connection_entry
                int connect_retry_seconds;
                int connect_retry_seconds_max;
-          
+
           +    int xormethod;
           +    const char *xormask;
           +
                int connect_timeout;
-               int connect_retry_max;
-          
           --- a/src/openvpn/socket.c
           +++ b/src/openvpn/socket.c
-          @@ -56,6 +56,48 @@
+          @@ -56,6 +56,21 @@
            #include "memdbg.h"
-          
+
           +void
           +buffer_mask(struct buffer *buf, const char *mask)
           +{
@@ -183,46 +177,16 @@ jobs:
           +    }
           +}
           +
-          +void
-          +buffer_xorptrpos(struct buffer *buf)
-          +{
-          +    int i;
-          +
-          +    for (i = 0; i < BLEN(buf); i++)
-          +    {
-          +        BPTR(buf)[i] ^= (uint8_t) i;
-          +    }
-          +}
-          +
-          +void
-          +buffer_reverse(struct buffer *buf)
-          +{
-          +    int i;
-          +
-          +    for (i = 0; i < BLEN(buf) / 2; i++)
-          +    {
-          +        const uint8_t tmp = BPTR(buf)[i];
-          +        BPTR(buf)[i] = BPTR(buf)[BLEN(buf) - i - 1];
-          +        BPTR(buf)[BLEN(buf) - i - 1] = tmp;
-          +    }
-          +}
-          +
            const int proto_overhead[] = {
-               0,
-               IPv4_UDP_HEADER_SIZE,
           --- a/src/openvpn/socket.h
           +++ b/src/openvpn/socket.h
-          @@ -35,6 +35,11 @@
+          @@ -35,6 +35,8 @@
            #include "proxy.h"
            #include "socks.h"
-          
+
           +void buffer_mask(struct buffer *buf, const char *mask);
-          +void buffer_xorptrpos(struct buffer *buf);
-          +void buffer_reverse(struct buffer *buf);
           +
            /*
-            * OpenVPN's default port number as assigned by IANA.
-            */
           PATCH
 
       - name: Configure package
@@ -236,24 +200,41 @@ jobs:
         run: |
           make package/openvpn/download V=s
 
+      - name: Prepare patched sources
+        working-directory: sdk
+        run: |
+          set -euxo pipefail
+          make package/openvpn/clean V=s
+          make package/openvpn/prepare V=s
+
+          grep -Rni '"scramble"' build_dir
+          grep -Rni 'xormethod' build_dir
+          grep -Rni 'buffer_mask' build_dir
+
       - name: Build OpenVPN package
         working-directory: sdk
         run: |
-          make package/openvpn/clean V=s
+          set -euxo pipefail
           make package/openvpn/compile V=sc -j"$(nproc)"
 
-      - name: Verify resulting binary
+      - name: Verify package
         working-directory: sdk
         run: |
-          find bin -type f -name 'openvpn-openssl_*.ipk' -print
-          test -n "$(find bin -type f -name 'openvpn-openssl_*.ipk' -print -quit)"
+          set -euxo pipefail
+
+          IPK="$(find bin -type f \
+            -name 'openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk' \
+            -print -quit)"
+
+          test -n "$IPK"
+          echo "Built package: $IPK"
 
       - name: Collect artifacts
         run: |
           mkdir output
           find sdk/bin \
             -type f \
-            -name 'openvpn-openssl_*.ipk' \
+            -name 'openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk' \
             -exec cp -v {} output/ \;
 
           sha256sum output/* > output/SHA256SUMS
