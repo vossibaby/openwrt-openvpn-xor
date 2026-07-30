@@ -18,6 +18,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          set -euxo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -36,18 +38,29 @@ jobs:
             unzip \
             wget \
             file \
+            patch \
             zlib1g-dev
 
       - name: Download OpenWrt SDK
         run: |
-          wget -O openwrt-sdk.tar.xz "$SDK_URL"
-          echo "$SDK_SHA256  openwrt-sdk.tar.xz" | sha256sum -c -
-          mkdir sdk
-          tar -xJf openwrt-sdk.tar.xz --strip-components=1 -C sdk
+          set -euxo pipefail
 
-      - name: Update feeds
+          wget -O openwrt-sdk.tar.xz "$SDK_URL"
+
+          echo "$SDK_SHA256  openwrt-sdk.tar.xz" \
+            | sha256sum -c -
+
+          mkdir sdk
+
+          tar -xJf openwrt-sdk.tar.xz \
+            --strip-components=1 \
+            -C sdk
+
+      - name: Update OpenWrt feeds
         working-directory: sdk
         run: |
+          set -euxo pipefail
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -63,94 +76,203 @@ jobs:
             packages-source
 
           rm -rf package/feeds/packages/openvpn
-          cp -a packages-source/net/openvpn package/feeds/packages/openvpn
 
-          sed -i 's/^PKG_RELEASE:=.*/PKG_RELEASE:=99/' \
+          mkdir -p package/feeds/packages
+
+          cp -a \
+            packages-source/net/openvpn \
+            package/feeds/packages/openvpn
+
+          sed -i \
+            's/^PKG_RELEASE:=.*/PKG_RELEASE:=99/' \
             package/feeds/packages/openvpn/Makefile
 
-          grep -E '^PKG_(VERSION|RELEASE):=' \
+          grep -E \
+            '^PKG_(VERSION|RELEASE):=' \
             package/feeds/packages/openvpn/Makefile
 
-            - name: Add Tunnelblick XOR patches
+      - name: Add OpenVPN XOR patches
         working-directory: sdk
         run: |
           set -euxo pipefail
 
-          PATCH_DIR="package/feeds/packages/openvpn/patches"
-          mkdir -p "$PATCH_DIR"
+          git clone \
+            --depth 1 \
+            https://github.com/egc112/OpenWRT-egc-add-on.git \
+            egc-add-on
 
-          BASE_URL="https://raw.githubusercontent.com/Tunnelblick/Tunnelblick/master/third_party/sources/openvpn/openvpn-2.5.8/patches"
+          PATCH_SOURCE="egc-add-on/openvpn-scramble/feeds/515"
+          PATCH_DEST="package/feeds/packages/openvpn/patches"
 
-          wget -O "$PATCH_DIR/999-xor-a.patch" \
-            "$BASE_URL/02-tunnelblick-openvpn_xorpatch-a.diff"
+          test -d "$PATCH_SOURCE"
 
-          wget -O "$PATCH_DIR/999-xor-b.patch" \
-            "$BASE_URL/03-tunnelblick-openvpn_xorpatch-b.diff"
+          mkdir -p "$PATCH_DEST"
 
-          wget -O "$PATCH_DIR/999-xor-c.patch" \
-            "$BASE_URL/04-tunnelblick-openvpn_xorpatch-c.diff"
+          find "$PATCH_SOURCE" \
+            -maxdepth 1 \
+            -type f \
+            \( -name '*.patch' -o -name '*.diff' \) \
+            -print
 
-          wget -O "$PATCH_DIR/999-xor-d.patch" \
-            "$BASE_URL/05-tunnelblick-openvpn_xorpatch-d.diff"
+          PATCH_COUNT="$(
+            find "$PATCH_SOURCE" \
+              -maxdepth 1 \
+              -type f \
+              \( -name '*.patch' -o -name '*.diff' \) \
+              | wc -l
+          )"
 
-          wget -O "$PATCH_DIR/999-xor-e.patch" \
-            "$BASE_URL/06-tunnelblick-openvpn_xorpatch-e.diff"
+          test "$PATCH_COUNT" -gt 0
 
-          for patch_file in "$PATCH_DIR"/999-xor-*.patch; do
-            echo "Downloaded: $patch_file"
-            test -s "$patch_file"
-            head -n 5 "$patch_file"
-          done
+          cp -v \
+            "$PATCH_SOURCE"/*.patch \
+            "$PATCH_DEST"/
 
-      - name: Configure package
+          echo "Copied XOR patches: $PATCH_COUNT"
+
+          ls -lah "$PATCH_DEST"
+
+      - name: Configure OpenVPN package
         working-directory: sdk
         run: |
-          echo "CONFIG_PACKAGE_openvpn-openssl=y" > .config
+          set -euxo pipefail
+
+          cat > .config <<'EOF'
+          CONFIG_PACKAGE_openvpn-openssl=y
+          EOF
+
           make defconfig
 
-      - name: Download package sources
-        working-directory: sdk
-        run: |
-          make package/openvpn/download V=s
+          grep \
+            '^CONFIG_PACKAGE_openvpn-openssl=y' \
+            .config
 
-      - name: Prepare patched sources
+      - name: Download OpenVPN sources
         working-directory: sdk
         run: |
           set -euxo pipefail
-          make package/openvpn/clean V=s
-          make package/openvpn/prepare V=s
 
-          grep -Rni '"scramble"' build_dir
-          grep -Rni 'xormethod' build_dir
-          grep -Rni 'buffer_mask' build_dir
+          make package/openvpn/download V=s
+
+      - name: Prepare patched OpenVPN sources
+        working-directory: sdk
+        run: |
+          set -euxo pipefail
+
+          make package/openvpn/clean V=s
+          make package/openvpn/prepare V=sc
+
+          BUILD_DIR="$(
+            find build_dir \
+              -type d \
+              -path '*openvpn-openssl/openvpn-2.5.8' \
+              -print \
+              -quit
+          )"
+
+          test -n "$BUILD_DIR"
+
+          echo "OpenVPN build directory: $BUILD_DIR"
+
+          grep -Rni \
+            --include='*.c' \
+            --include='*.h' \
+            --include='*.rst' \
+            --include='*.txt' \
+            'scramble' \
+            "$BUILD_DIR"
+
+          grep -Rni \
+            --include='*.c' \
+            --include='*.h' \
+            'xormethod' \
+            "$BUILD_DIR"
+
+          echo "XOR patches successfully applied."
 
       - name: Build OpenVPN package
         working-directory: sdk
         run: |
           set -euxo pipefail
-          make package/openvpn/compile V=sc -j"$(nproc)"
 
-      - name: Verify package
+          make package/openvpn/compile \
+            V=sc \
+            -j"$(nproc)"
+
+      - name: Find built package
         working-directory: sdk
         run: |
           set -euxo pipefail
 
-          IPK="$(find bin -type f \
-            -name 'openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk' \
-            -print -quit)"
+          find bin \
+            -type f \
+            -name 'openvpn-openssl_*.ipk' \
+            -print
+
+          IPK="$(
+            find bin \
+              -type f \
+              -name 'openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk' \
+              -print \
+              -quit
+          )"
 
           test -n "$IPK"
+
           echo "Built package: $IPK"
+
+          cp "$IPK" "$GITHUB_WORKSPACE/openvpn-xor.ipk"
+
+      - name: Verify XOR inside binary
+        run: |
+          set -euxo pipefail
+
+          rm -rf extracted-ipk
+          mkdir extracted-ipk
+          cd extracted-ipk
+
+          ar x "$GITHUB_WORKSPACE/openvpn-xor.ipk"
+
+          mkdir rootfs
+
+          DATA_ARCHIVE="$(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name 'data.tar.*' \
+              -print \
+              -quit
+          )"
+
+          test -n "$DATA_ARCHIVE"
+
+          tar -xf "$DATA_ARCHIVE" -C rootfs
+
+          test -x rootfs/usr/sbin/openvpn
+
+          strings rootfs/usr/sbin/openvpn \
+            | grep -i 'scramble'
+
+          strings rootfs/usr/sbin/openvpn \
+            | grep -i 'obfuscate'
+
+          echo "OpenVPN binary contains XOR scramble support."
 
       - name: Collect artifacts
         run: |
-          mkdir output
-          find sdk/bin \
-            -type f \
-            -name 'openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk' \
-            -exec cp -v {} output/ \;
+          set -euxo pipefail
 
-          sha256sum output/* > output/SHA256SUMS
+          mkdir -p output
+
+          cp \
+            openvpn-xor.ipk \
+            output/openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk
+
+          sha256sum \
+            output/openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk \
+            > output/SHA256SUMS
+
+          ls -lah output
 
       - name: Upload OpenVPN package
         uses: actions/upload-artifact@v4
