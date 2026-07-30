@@ -21,6 +21,7 @@ jobs:
           set -euxo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             flex \
@@ -39,20 +40,25 @@ jobs:
             wget \
             file \
             patch \
+            binutils \
             zlib1g-dev
 
       - name: Download OpenWrt SDK
         run: |
           set -euxo pipefail
 
-          wget -O openwrt-sdk.tar.xz "$SDK_URL"
+          wget \
+            --progress=dot:giga \
+            -O openwrt-sdk.tar.xz \
+            "$SDK_URL"
 
           echo "$SDK_SHA256  openwrt-sdk.tar.xz" \
             | sha256sum -c -
 
-          mkdir sdk
+          mkdir -p sdk
 
-          tar -xJf openwrt-sdk.tar.xz \
+          tar \
+            -xJf openwrt-sdk.tar.xz \
             --strip-components=1 \
             -C sdk
 
@@ -68,6 +74,8 @@ jobs:
         working-directory: sdk
         run: |
           set -euxo pipefail
+
+          rm -rf packages-source
 
           git clone \
             --depth 1 \
@@ -87,14 +95,18 @@ jobs:
             's/^PKG_RELEASE:=.*/PKG_RELEASE:=99/' \
             package/feeds/packages/openvpn/Makefile
 
+          echo "Selected OpenVPN package:"
+
           grep -E \
             '^PKG_(VERSION|RELEASE):=' \
             package/feeds/packages/openvpn/Makefile
 
-      - name: Add OpenVPN XOR patches
+      - name: Add OpenVPN XOR scramble patches
         working-directory: sdk
         run: |
           set -euxo pipefail
+
+          rm -rf egc-add-on
 
           git clone \
             --depth 1 \
@@ -105,8 +117,9 @@ jobs:
           PATCH_DEST="package/feeds/packages/openvpn/patches"
 
           test -d "$PATCH_SOURCE"
+          test -d "$PATCH_DEST"
 
-          mkdir -p "$PATCH_DEST"
+          echo "Available XOR patches:"
 
           find "$PATCH_SOURCE" \
             -maxdepth 1 \
@@ -124,11 +137,21 @@ jobs:
 
           test "$PATCH_COUNT" -gt 0
 
-          cp -v \
-            "$PATCH_SOURCE"/*.patch \
-            "$PATCH_DEST"/
+          while IFS= read -r PATCH_FILE; do
+            PATCH_NAME="$(basename "$PATCH_FILE")"
 
-          echo "Copied XOR patches: $PATCH_COUNT"
+            cp -v \
+              "$PATCH_FILE" \
+              "$PATCH_DEST/9${PATCH_NAME}"
+          done < <(
+            find "$PATCH_SOURCE" \
+              -maxdepth 1 \
+              -type f \
+              \( -name '*.patch' -o -name '*.diff' \) \
+              | sort
+          )
+
+          echo "OpenVPN patch directory:"
 
           ls -lah "$PATCH_DEST"
 
@@ -147,14 +170,14 @@ jobs:
             '^CONFIG_PACKAGE_openvpn-openssl=y' \
             .config
 
-      - name: Download OpenVPN sources
+      - name: Download OpenVPN source
         working-directory: sdk
         run: |
           set -euxo pipefail
 
           make package/openvpn/download V=s
 
-      - name: Prepare patched OpenVPN sources
+      - name: Apply and verify XOR patches
         working-directory: sdk
         run: |
           set -euxo pipefail
@@ -171,26 +194,36 @@ jobs:
           )"
 
           test -n "$BUILD_DIR"
+          test -d "$BUILD_DIR"
 
-          echo "OpenVPN build directory: $BUILD_DIR"
+          echo "Prepared source directory:"
+          echo "$BUILD_DIR"
+
+          echo "Checking scramble option in patched source:"
 
           grep -Rni \
             --include='*.c' \
             --include='*.h' \
             --include='*.rst' \
             --include='*.txt' \
+            --include='*.1' \
             'scramble' \
             "$BUILD_DIR"
+
+          echo "Checking obfuscate method in patched source:"
 
           grep -Rni \
             --include='*.c' \
             --include='*.h' \
-            'xormethod' \
+            --include='*.rst' \
+            --include='*.txt' \
+            --include='*.1' \
+            'obfuscate' \
             "$BUILD_DIR"
 
-          echo "XOR patches successfully applied."
+          echo "XOR scramble patches applied successfully."
 
-      - name: Build OpenVPN package
+      - name: Build OpenVPN XOR package
         working-directory: sdk
         run: |
           set -euxo pipefail
@@ -199,10 +232,12 @@ jobs:
             V=sc \
             -j"$(nproc)"
 
-      - name: Find built package
+      - name: Find built OpenVPN package
         working-directory: sdk
         run: |
           set -euxo pipefail
+
+          echo "All compiled OpenVPN packages:"
 
           find bin \
             -type f \
@@ -217,48 +252,185 @@ jobs:
               -quit
           )"
 
-          test -n "$IPK"
+          if [ -z "$IPK" ]; then
+            IPK="$(
+              find bin \
+                -type f \
+                -name 'openvpn-openssl_*.ipk' \
+                -print \
+                -quit
+            )"
+          fi
 
-          echo "Built package: $IPK"
+          test -n "$IPK"
+          test -s "$IPK"
+
+          echo "Selected package:"
+          echo "$IPK"
 
           cp "$IPK" "$GITHUB_WORKSPACE/openvpn-xor.ipk"
 
-      - name: Verify XOR inside binary
+      - name: Inspect IPK package format
         run: |
           set -euxo pipefail
 
-          rm -rf extracted-ipk
-          mkdir extracted-ipk
-          cd extracted-ipk
+          IPK="$GITHUB_WORKSPACE/openvpn-xor.ipk"
 
-          ar x "$GITHUB_WORKSPACE/openvpn-xor.ipk"
+          test -s "$IPK"
 
-          mkdir rootfs
+          file "$IPK"
+
+          echo "First bytes:"
+
+          od \
+            -An \
+            -tx1 \
+            -N16 \
+            "$IPK"
+
+      - name: Extract and verify OpenVPN binary
+        run: |
+          set -euxo pipefail
+
+          IPK="$GITHUB_WORKSPACE/openvpn-xor.ipk"
+
+          rm -rf "$GITHUB_WORKSPACE/extracted-ipk"
+
+          mkdir -p \
+            "$GITHUB_WORKSPACE/extracted-ipk/package" \
+            "$GITHUB_WORKSPACE/extracted-ipk/rootfs"
+
+          cd "$GITHUB_WORKSPACE/extracted-ipk"
+
+          if ar t "$IPK" >/dev/null 2>&1; then
+            echo "Detected AR-format IPK"
+
+            cd package
+            ar x "$IPK"
+            cd ..
+
+          elif tar -tf "$IPK" >/dev/null 2>&1; then
+            echo "Detected TAR-format IPK"
+
+            tar \
+              -xf "$IPK" \
+              -C package
+
+          else
+            echo "ERROR: Unknown IPK package format"
+
+            file "$IPK" || true
+            od -An -tx1 -N32 "$IPK" || true
+
+            exit 1
+          fi
+
+          echo "Extracted package files:"
+
+          find package \
+            -maxdepth 2 \
+            -type f \
+            -print
 
           DATA_ARCHIVE="$(
-            find . \
-              -maxdepth 1 \
+            find package \
+              -maxdepth 2 \
               -type f \
-              -name 'data.tar.*' \
+              \( \
+                -name 'data.tar' \
+                -o -name 'data.tar.gz' \
+                -o -name 'data.tar.xz' \
+                -o -name 'data.tar.zst' \
+                -o -name 'data.tar.bz2' \
+              \) \
               -print \
               -quit
           )"
 
           test -n "$DATA_ARCHIVE"
+          test -s "$DATA_ARCHIVE"
 
-          tar -xf "$DATA_ARCHIVE" -C rootfs
+          echo "Data archive:"
+          echo "$DATA_ARCHIVE"
 
-          test -x rootfs/usr/sbin/openvpn
+          tar \
+            -xf "$DATA_ARCHIVE" \
+            -C rootfs
 
-          strings rootfs/usr/sbin/openvpn \
+          OPENVPN_BIN="$(
+            find rootfs \
+              -type f \
+              -path '*/usr/sbin/openvpn' \
+              -print \
+              -quit
+          )"
+
+          test -n "$OPENVPN_BIN"
+          test -s "$OPENVPN_BIN"
+
+          echo "OpenVPN binary:"
+          echo "$OPENVPN_BIN"
+
+          file "$OPENVPN_BIN"
+
+          echo "Checking scramble support inside binary:"
+
+          strings "$OPENVPN_BIN" \
             | grep -i 'scramble'
 
-          strings rootfs/usr/sbin/openvpn \
+          echo "Checking obfuscate support inside binary:"
+
+          strings "$OPENVPN_BIN" \
             | grep -i 'obfuscate'
 
-          echo "OpenVPN binary contains XOR scramble support."
+          echo "Checking XOR implementation inside binary:"
 
-      - name: Collect artifacts
+          strings "$OPENVPN_BIN" \
+            | grep -Ei 'xormask|xorptrpos|xormethod|scramble'
+
+          echo "OpenVPN binary contains scramble obfuscate support."
+
+      - name: Create test configuration
+        run: |
+          set -euxo pipefail
+
+          mkdir -p output
+
+          cat > output/test-xor.ovpn <<'EOF'
+          client
+          proto udp
+          explicit-exit-notify
+          remote lambank.shop 444
+          dev tun
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          verify-x509-name server_i8Vy6DVM2sdIXxxN name
+          auth SHA256
+          auth-nocache
+          cipher AES-128-GCM
+          tls-client
+          tls-version-min 1.2
+          tls-cipher TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256
+          ignore-unknown-option block-outside-dns
+          setenv opt block-outside-dns
+          verb 3
+          scramble obfuscate !spPfxyUuH2|O8;1
+          mute-replay-warnings
+          connect-timeout 5
+          keepalive 5 30
+          ping-timer-rem
+          auth-retry nointeract
+          connect-retry 5 30
+          EOF
+
+          grep -F \
+            'scramble obfuscate !spPfxyUuH2|O8;1' \
+            output/test-xor.ovpn
+
+      - name: Collect build files
         run: |
           set -euxo pipefail
 
@@ -272,12 +444,16 @@ jobs:
             output/openvpn-openssl_2.5.8-99_aarch64_cortex-a53.ipk \
             > output/SHA256SUMS
 
+          echo "Build output:"
+
           ls -lah output
 
-      - name: Upload OpenVPN package
+          cat output/SHA256SUMS
+
+      - name: Upload OpenVPN XOR package
         uses: actions/upload-artifact@v4
         with:
-          name: openvpn-xor-openwrt-23.05.0-mt7622
+          name: openvpn-xor-openwrt-23.05.0-ax6s
           path: output/
           if-no-files-found: error
           retention-days: 30
